@@ -2,13 +2,22 @@
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime
+from datetime import date
+
+# ==========================================
+# NIFTY QUANT LAB
+# Upstox market data + risk calculator
+# Broker order placement is disabled.
+# ==========================================
 
 st.set_page_config(
     page_title="NIFTY Quant Lab",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
 )
+
+API_BASE = "https://api.upstox.com/v2"
+INDEX_KEY = "NSE_INDEX|Nifty 50"
 
 st.title("📈 NIFTY Quant Lab")
 st.caption("NIFTY options research and risk dashboard")
@@ -18,378 +27,410 @@ st.warning(
     "or cancel live broker orders."
 )
 
-# --------------------------------------------------
-# UPSTOX READ-ONLY QUOTE
-# --------------------------------------------------
 
-st.subheader("Upstox Connection")
+def get_token():
+    return st.secrets.get("UPSTOX_ACCESS_TOKEN", "").strip()
 
 
-def get_upstox_quote():
-    """Fetch a read-only NIFTY 50 quote."""
-
-    token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+def upstox_get(endpoint, params=None):
+    token = get_token()
 
     if not token:
-        return None, (
-            "Access token is missing. Check Streamlit Secrets."
+        raise ValueError(
+            "UPSTOX_ACCESS_TOKEN is missing from Streamlit Secrets."
         )
 
-    url = "https://api.upstox.com/v2/market-quote/quotes"
+    response = requests.get(
+        f"{API_BASE}{endpoint}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        params=params or {},
+        timeout=20,
+    )
 
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    params = {
-        "instrument_key": "NSE_INDEX|Nifty 50"
-    }
-
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=15
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Upstox HTTP {response.status_code}: "
+            f"{response.text[:1000]}"
         )
 
-        if response.status_code != 200:
-            return None, (
-                f"Upstox returned HTTP {response.status_code}. "
-                "Check whether your access token is valid."
-            )
+    result = response.json()
 
-        payload = response.json()
-        data = payload.get("data", {})
+    if result.get("status") == "error":
+        raise RuntimeError(str(result.get("errors", result))[:1000])
 
-        if not data:
-            return None, "Upstox returned no quote data."
+    return result.get("data")
 
-        quote = next(iter(data.values()), None)
 
-        if not isinstance(quote, dict):
-            return None, "Unexpected quote response format."
+# ==========================================
+# UPSTOX CONNECTION AND NIFTY QUOTE
+# ==========================================
 
-        last_price = quote.get("last_price")
-
-        if last_price is None:
-            return None, "The quote has no last_price field."
-
-        return float(last_price), None
-
-    except requests.Timeout:
-        return None, "Upstox request timed out. Try again."
-
-    except requests.RequestException:
-        return None, (
-            "Unable to connect to Upstox. Check your internet."
-        )
-
-    except (ValueError, TypeError):
-        return None, (
-            "Upstox returned data that could not be processed."
-        )
-
+st.header("Upstox Connection")
 
 if st.button("Test Upstox connection / Refresh NIFTY quote"):
-    with st.spinner("Checking Upstox..."):
-        quote, error = get_upstox_quote()
+    try:
+        with st.spinner("Fetching NIFTY quote..."):
+            data = upstox_get(
+                "/market-quote/quotes",
+                {"instrument_key": INDEX_KEY},
+            )
 
-    if error:
-        st.error(error)
-    else:
-        st.success("Quote request succeeded.")
-        st.metric("NIFTY 50 quote (₹)", f"{quote:,.2f}")
-        st.caption(
-            "Manual refresh only. Check market status and "
-            "quote freshness before relying on the price."
-        )
+        if not data:
+            st.warning("Upstox returned no quote data.")
+        else:
+            quote = next(iter(data.values()))
+            ltp = quote.get("last_price")
+
+            if ltp is None:
+                st.warning("Quote returned, but last price was missing.")
+                st.json(quote)
+            else:
+                st.success("Quote request succeeded.")
+                st.metric("NIFTY 50 quote (₹)", f"{float(ltp):,.2f}")
+                st.caption(
+                    "Manual refresh only. Verify quote freshness "
+                    "and market status before relying on this value."
+                )
+
+    except Exception as exc:
+        st.error(f"Quote request failed: {exc}")
+
+
+# ==========================================
+# OPTION CHAIN AND EXPIRY SELECTION
+# ==========================================
 
 st.divider()
-
-# --------------------------------------------------
-# MARKET INPUTS
-# --------------------------------------------------
-
-st.subheader("Market Inputs")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    nifty = st.number_input(
-        "NIFTY spot price (manual input)",
-        min_value=0.0,
-        value=25000.0,
-        step=50.0
-    )
-
-with col2:
-    capital = st.number_input(
-        "Trading capital (₹)",
-        min_value=0,
-        value=25000,
-        step=1000
-    )
-
-# --------------------------------------------------
-# RISK CONTROLS
-# --------------------------------------------------
-
-st.subheader("Risk Controls")
-
-risk_pct = st.slider(
-    "Maximum planned risk per trade (%)",
-    min_value=0.5,
-    max_value=2.0,
-    value=1.0,
-    step=0.5
+st.header("📊 NIFTY Option Chain")
+st.caption(
+    "Read-only option-chain data from Upstox. "
+    "No orders are placed by this section."
 )
 
-risk_amount = capital * risk_pct / 100
+if "nifty_expiries" not in st.session_state:
+    st.session_state["nifty_expiries"] = []
 
-col1, col2 = st.columns(2)
+if st.button("Load available NIFTY expiry dates"):
+    try:
+        with st.spinner("Loading available expiry dates..."):
+            contracts = upstox_get(
+                "/option/contract",
+                {"instrument_key": INDEX_KEY},
+            )
 
-with col1:
-    st.metric(
-        "Planned risk budget",
-        f"₹{risk_amount:,.0f}"
+        if not isinstance(contracts, list):
+            st.error("Unexpected response while loading expiry dates.")
+            st.json(contracts)
+        else:
+            today = date.today().isoformat()
+            expiries = sorted({
+                str(item.get("expiry"))
+                for item in contracts
+                if item.get("expiry")
+                and str(item.get("expiry")) >= today
+            })
+
+            st.session_state["nifty_expiries"] = expiries
+
+            if expiries:
+                st.success(f"Found {len(expiries)} future expiry dates.")
+            else:
+                st.warning(
+                    "No future expiries were returned. "
+                    "Check the API response and market data access."
+                )
+
+    except Exception as exc:
+        st.error(f"Could not load expiry dates: {exc}")
+
+expiries = st.session_state["nifty_expiries"]
+
+if expiries:
+    selected_expiry = st.selectbox(
+        "Select NIFTY option expiry",
+        expiries,
+        key="selected_nifty_expiry",
     )
 
-with col2:
-    st.metric(
-        "Manual NIFTY level",
-        f"{nifty:,.2f}"
-    )
+    if st.button("Fetch NIFTY Option Chain"):
+        try:
+            with st.spinner("Fetching option-chain data..."):
+                chain = upstox_get(
+                    "/option/chain",
+                    {
+                        "instrument_key": INDEX_KEY,
+                        "expiry_date": selected_expiry,
+                    },
+                )
 
-# --------------------------------------------------
+            if not isinstance(chain, list) or not chain:
+                st.warning(
+                    "No option-chain rows returned for this expiry."
+                )
+            else:
+                rows = []
+
+                for item in chain:
+                    call = item.get("call_options") or {}
+                    put = item.get("put_options") or {}
+
+                    call_market = call.get("market_data") or {}
+                    put_market = put.get("market_data") or {}
+
+                    call_greeks = call.get("option_greeks") or {}
+                    put_greeks = put.get("option_greeks") or {}
+
+                    rows.append({
+                        "Strike": item.get("strike_price"),
+                        "Call LTP": call_market.get("ltp"),
+                        "Call Bid": call_market.get("bid_price"),
+                        "Call Ask": call_market.get("ask_price"),
+                        "Call Volume": call_market.get("volume"),
+                        "Call OI": call_market.get("oi"),
+                        "Call IV": call_greeks.get("iv"),
+                        "Put LTP": put_market.get("ltp"),
+                        "Put Bid": put_market.get("bid_price"),
+                        "Put Ask": put_market.get("ask_price"),
+                        "Put Volume": put_market.get("volume"),
+                        "Put OI": put_market.get("oi"),
+                        "Put IV": put_greeks.get("iv"),
+                    })
+
+                df_chain = pd.DataFrame(rows)
+
+                if "Strike" in df_chain.columns:
+                    df_chain = df_chain.sort_values(
+                        "Strike",
+                        ascending=True,
+                        na_position="last",
+                    )
+
+                st.success(
+                    f"Loaded {len(df_chain)} option-chain rows "
+                    f"for expiry {selected_expiry}."
+                )
+
+                st.dataframe(
+                    df_chain,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.download_button(
+                    "Download option chain CSV",
+                    data=df_chain.to_csv(index=False),
+                    file_name=f"nifty_option_chain_{selected_expiry}.csv",
+                    mime="text/csv",
+                )
+
+                st.caption(
+                    "Verify data freshness, bid/ask spreads, and "
+                    "expiry before using market data for decisions."
+                )
+
+        except Exception as exc:
+            st.error(f"Option-chain request failed: {exc}")
+
+
+# ==========================================
+# MARKET INPUTS
+# ==========================================
+
+st.divider()
+st.header("Market Inputs")
+
+spot = st.number_input(
+    "NIFTY spot price (manual input)",
+    min_value=0.0,
+    value=25000.0,
+    step=1.0,
+)
+
+capital = st.number_input(
+    "Trading capital (₹)",
+    min_value=0.0,
+    value=25000.0,
+    step=1000.0,
+)
+
+max_risk = st.number_input(
+    "Maximum planned risk per trade (₹)",
+    min_value=1.0,
+    value=500.0,
+    step=50.0,
+)
+
+st.caption(
+    "Manual spot input is not automatically updated by the quote button."
+)
+
+
+# ==========================================
 # TRADE RISK CALCULATOR
-# --------------------------------------------------
+# ==========================================
 
-st.subheader("Trade Planning")
+st.divider()
+st.header("Trade Planning")
 
 option_type = st.selectbox(
     "Option type",
-    ["CE", "PE"]
+    ["CE", "PE"],
 )
 
-premium = st.number_input(
+entry_premium = st.number_input(
     "Option entry premium (₹)",
-    min_value=0.0,
+    min_value=0.05,
     value=100.0,
-    step=1.0
+    step=1.0,
 )
 
 stop_premium = st.number_input(
     "Planned stop-loss premium (₹)",
     min_value=0.0,
     value=80.0,
-    step=1.0
+    step=1.0,
 )
 
 lot_size = st.number_input(
     "Lot size (verify current exchange specification)",
     min_value=1,
     value=65,
-    step=1
+    step=1,
 )
 
 if st.button("Calculate trade risk"):
-    if premium <= stop_premium:
+    loss_per_unit = entry_premium - stop_premium
+
+    if entry_premium <= 0:
+        st.error("Entry premium must be greater than zero.")
+    elif stop_premium >= entry_premium:
         st.error(
-            "Entry premium must be greater than stop-loss premium."
+            "For a long option buy, the planned stop premium "
+            "must be below the entry premium."
         )
     else:
-        loss_per_unit = premium - stop_premium
-        loss_per_lot = loss_per_unit * lot_size
-        max_lots = int(risk_amount // loss_per_lot)
+        risk_per_unit = loss_per_unit
+        risk_per_lot = risk_per_unit * lot_size
 
-        st.metric(
-            "Estimated loss per lot",
-            f"₹{loss_per_lot:,.2f}"
+        lots_by_risk = int(max_risk // risk_per_lot)
+        lots_by_capital = int(
+            capital // (entry_premium * lot_size)
         )
 
-        st.metric("Lots within risk budget", max_lots)
+        allowed_lots = max(
+            0,
+            min(lots_by_risk, lots_by_capital),
+        )
 
-        if max_lots == 0:
+        estimated_risk = allowed_lots * risk_per_lot
+        estimated_cost = (
+            allowed_lots * entry_premium * lot_size
+        )
+
+        st.metric("Planned risk per lot", f"₹{risk_per_lot:,.2f}")
+        st.metric("Allowed lots under inputs", allowed_lots)
+        st.metric("Estimated premium outlay", f"₹{estimated_cost:,.2f}")
+        st.metric("Planned stop-loss amount", f"₹{estimated_risk:,.2f}")
+
+        if allowed_lots == 0:
             st.warning(
-                "One lot exceeds your planned risk budget."
-            )
-        else:
-            st.info(
-                "Planning calculation only. Charges, slippage, "
-                "and gap risk are excluded."
+                "No lot fits both the planned risk and capital limits."
             )
 
-# --------------------------------------------------
+        st.caption(
+            "Estimate excludes charges, slippage, gaps, and execution "
+            "failures. Actual losses can exceed the planned risk."
+        )
+
+
+# ==========================================
 # PAPER-TRADE JOURNAL
-# --------------------------------------------------
+# ==========================================
 
-st.subheader("Paper-Trade Journal")
+st.divider()
+st.header("Paper Trade Journal")
+st.caption("Simulated records only. No broker orders are placed.")
 
-if "trades" not in st.session_state:
-    st.session_state.trades = []
+if "paper_trades" not in st.session_state:
+    st.session_state["paper_trades"] = []
 
 with st.form("paper_trade_form"):
-    symbol = st.text_input("Instrument", "NIFTY")
-
-    side = st.selectbox(
-        "Position",
-        ["BUY CE", "BUY PE"]
+    paper_action = st.selectbox(
+        "Paper action",
+        ["BUY CE", "BUY PE"],
     )
 
-    entry = st.number_input(
+    paper_entry = st.number_input(
         "Paper entry premium",
         min_value=0.0,
-        value=100.0
+        value=100.0,
+        step=1.0,
     )
 
-    exit_price = st.number_input(
+    paper_exit = st.number_input(
         "Paper exit premium",
         min_value=0.0,
-        value=105.0
+        value=105.0,
+        step=1.0,
     )
 
-    quantity = st.number_input(
+    paper_quantity = st.number_input(
         "Quantity in units",
         min_value=1,
-        value=1
+        value=1,
+        step=1,
     )
 
-    submitted = st.form_submit_button("Save paper trade")
+    save_paper = st.form_submit_button("Save paper trade")
 
-    if submitted:
-        pnl = (exit_price - entry) * quantity
+if save_paper:
+    pnl = (paper_exit - paper_entry) * paper_quantity
 
-        st.session_state.trades.append({
-            "Time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "Instrument": symbol,
-            "Position": side,
-            "Entry": entry,
-            "Exit": exit_price,
-            "Quantity": quantity,
-            "Paper P&L": round(pnl, 2)
-        })
+    st.session_state["paper_trades"].append({
+        "Date": date.today().isoformat(),
+        "Action": paper_action,
+        "Entry premium": paper_entry,
+        "Exit premium": paper_exit,
+        "Quantity": paper_quantity,
+        "P&L (₹)": round(pnl, 2),
+    })
 
-        st.success("Paper trade saved for this session.")
+    st.success("Paper trade saved in this session.")
 
-if st.session_state.trades:
-    df = pd.DataFrame(st.session_state.trades)
+if st.session_state["paper_trades"]:
+    journal = pd.DataFrame(st.session_state["paper_trades"])
 
     st.dataframe(
-        df,
-        use_container_width=True
+        journal,
+        use_container_width=True,
+        hide_index=True,
     )
 
-    st.metric(
-        "Total paper P&L",
-        f"₹{df['Paper P&L'].sum():,.2f}"
+    total_pnl = journal["P&L (₹)"].sum()
+    st.metric("Total paper P&L (₹)", f"{total_pnl:,.2f}")
+
+    st.download_button(
+        "Download paper journal CSV",
+        data=journal.to_csv(index=False),
+        file_name="nifty_paper_journal.csv",
+        mime="text/csv",
     )
 
-# --------------------------------------------------
+    if st.button("Clear paper journal"):
+        st.session_state["paper_trades"] = []
+        st.rerun()
+
+
+# ==========================================
 # FOOTER
-# --------------------------------------------------
+# ==========================================
 
 st.divider()
-
 st.caption(
-    "Educational research tool. No broker order execution "
-    "is implemented. Quote availability and freshness are "
-    "not guaranteed. This app is not a continuous monitor."
+    "Educational research tool. No broker order execution is "
+    "implemented. Quote freshness is not guaranteed. "
+    "This app is not a continuous monitor."
 )
-
-
-# ==========================================
-# NIFTY OPTION CHAIN - READ ONLY
-# ==========================================
-
-st.divider()
-st.header("📊 NIFTY Option Chain")
-st.caption("Read-only market data. This section does not place orders.")
-
-option_expiry = st.date_input(
-    "Select NIFTY option expiry date",
-    key="nifty_option_expiry"
-)
-
-if st.button("Fetch NIFTY Option Chain", key="fetch_nifty_chain"):
-    access_token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
-
-    if not access_token:
-        st.error("UPSTOX_ACCESS_TOKEN is missing from Streamlit Secrets.")
-    else:
-        try:
-            with st.spinner("Fetching option-chain data..."):
-                response = requests.get(
-                    "https://api.upstox.com/v2/option/chain",
-                    headers={
-                        "Accept": "application/json",
-                        "Authorization": f"Bearer {access_token}"
-                    },
-                    params={
-                        "instrument_key": "NSE_INDEX|Nifty 50",
-                        "expiry_date": option_expiry.strftime("%Y-%m-%d")
-                    },
-                    timeout=20
-                )
-
-            if response.status_code != 200:
-                st.error(
-                    f"Upstox returned HTTP {response.status_code}. "
-                    "Check the expiry date and API response."
-                )
-                st.code(response.text[:1500])
-
-            else:
-                payload = response.json()
-                chain = payload.get("data", [])
-
-                if not chain:
-                    st.warning(
-                        "No option-chain rows returned. "
-                        "Select a valid listed expiry date."
-                    )
-                else:
-                    rows = []
-
-                    for item in chain:
-                        call = item.get("call_options") or {}
-                        put = item.get("put_options") or {}
-
-                        call_market = call.get("market_data") or {}
-                        put_market = put.get("market_data") or {}
-
-                        rows.append({
-                            "Strike": item.get("strike_price"),
-                            "Call LTP": call_market.get("ltp"),
-                            "Call OI": call_market.get("oi"),
-                            "Call Volume": call_market.get("volume"),
-                            "Put LTP": put_market.get("ltp"),
-                            "Put OI": put_market.get("oi"),
-                            "Put Volume": put_market.get("volume"),
-                        })
-
-                    df_chain = pd.DataFrame(rows)
-                    df_chain = df_chain.sort_values(
-                        "Strike", ascending=True
-                    )
-
-                    st.success(
-                        f"Loaded {len(df_chain)} option-chain strikes."
-                    )
-                    st.dataframe(
-                        df_chain,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                    st.caption(
-                        "Prices and open interest are returned by Upstox. "
-                        "Verify freshness and expiry before relying on them."
-                    )
-
-        except requests.RequestException as error:
-            st.error(f"Network request failed: {error}")
-        except (ValueError, TypeError, KeyError) as error:
-            st.error(f"Could not process the option-chain response: {error}")
-
