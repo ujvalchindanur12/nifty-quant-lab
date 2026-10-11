@@ -297,3 +297,99 @@ st.caption(
     "is implemented. Quote availability and freshness are "
     "not guaranteed. This app is not a continuous monitor."
 )
+
+
+# ==========================================
+# NIFTY OPTION CHAIN - READ ONLY
+# ==========================================
+
+st.divider()
+st.header("📊 NIFTY Option Chain")
+st.caption("Read-only market data. This section does not place orders.")
+
+option_expiry = st.date_input(
+    "Select NIFTY option expiry date",
+    key="nifty_option_expiry"
+)
+
+if st.button("Fetch NIFTY Option Chain", key="fetch_nifty_chain"):
+    access_token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+
+    if not access_token:
+        st.error("UPSTOX_ACCESS_TOKEN is missing from Streamlit Secrets.")
+    else:
+        try:
+            with st.spinner("Fetching option-chain data..."):
+                response = requests.get(
+                    "https://api.upstox.com/v2/option/chain",
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {access_token}"
+                    },
+                    params={
+                        "instrument_key": "NSE_INDEX|Nifty 50",
+                        "expiry_date": option_expiry.strftime("%Y-%m-%d")
+                    },
+                    timeout=20
+                )
+
+            if response.status_code != 200:
+                st.error(
+                    f"Upstox returned HTTP {response.status_code}. "
+                    "Check the expiry date and API response."
+                )
+                st.code(response.text[:1500])
+
+            else:
+                payload = response.json()
+                chain = payload.get("data", [])
+
+                if not chain:
+                    st.warning(
+                        "No option-chain rows returned. "
+                        "Select a valid listed expiry date."
+                    )
+                else:
+                    rows = []
+
+                    for item in chain:
+                        call = item.get("call_options") or {}
+                        put = item.get("put_options") or {}
+
+                        call_market = call.get("market_data") or {}
+                        put_market = put.get("market_data") or {}
+
+                        rows.append({
+                            "Strike": item.get("strike_price"),
+                            "Call LTP": call_market.get("ltp"),
+                            "Call OI": call_market.get("oi"),
+                            "Call Volume": call_market.get("volume"),
+                            "Put LTP": put_market.get("ltp"),
+                            "Put OI": put_market.get("oi"),
+                            "Put Volume": put_market.get("volume"),
+                        })
+
+                    df_chain = pd.DataFrame(rows)
+                    df_chain = df_chain.sort_values(
+                        "Strike", ascending=True
+                    )
+
+                    st.success(
+                        f"Loaded {len(df_chain)} option-chain strikes."
+                    )
+                    st.dataframe(
+                        df_chain,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.caption(
+                        "Prices and open interest are returned by Upstox. "
+                        "Verify freshness and expiry before relying on them."
+                    )
+
+        except requests.RequestException as error:
+            st.error(f"Network request failed: {error}")
+        except (ValueError, TypeError, KeyError) as error:
+            st.error(f"Could not process the option-chain response: {error}")
+
