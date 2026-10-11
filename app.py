@@ -10,37 +10,30 @@ layout="wide"
 )
 
 st.title("📈 NIFTY Quant Lab")
-st.caption("NIFTY options research, live-data connection and risk dashboard")
-
---------------------------------------------------
-
-SAFETY: READ-ONLY MODE
-
---------------------------------------------------
+st.caption("NIFTY options research and risk dashboard")
 
 st.warning(
-"READ-ONLY MODE: This app does not place, modify, "
-"or cancel broker orders. Verify all prices before trading."
+"READ-ONLY MODE: No live orders are placed, modified, "
+"or cancelled by this app."
 )
 
 --------------------------------------------------
 
-UPSTOX CONFIGURATION
+UPSTOX READ-ONLY QUOTE
 
 --------------------------------------------------
 
 st.subheader("🔌 Upstox Connection")
 
 def get_upstox_quote():
-"""Fetch a read-only NIFTY index quote from Upstox."""
+"""Fetch a read-only NIFTY 50 quote."""
 
 try:
     token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
 
     if not token:
         return None, (
-            "Access token is missing. Add a valid "
-            "UPSTOX_ACCESS_TOKEN in Streamlit Secrets."
+            "Access token is missing. Check Streamlit Secrets."
         )
 
     headers = {
@@ -48,10 +41,9 @@ try:
         "Authorization": f"Bearer {token}"
     }
 
-    # Upstox V2 full market quote endpoint.
-    # Nifty 50 instrument key:
-    # NSE_INDEX|Nifty 50
-    url = "https://api.upstox.com/v2/market-quote/quotes"
+    url = (
+        "https://api.upstox.com/v2/market-quote/quotes"
+    )
 
     params = {
         "instrument_key": "NSE_INDEX|Nifty 50"
@@ -67,9 +59,7 @@ try:
     if response.status_code != 200:
         return None, (
             f"Upstox returned HTTP {response.status_code}. "
-            "Check token validity and API permissions. "
-            "The response body is hidden to avoid exposing "
-            "account or authentication details."
+            "Check token validity and API permissions."
         )
 
     payload = response.json()
@@ -77,40 +67,34 @@ try:
 
     if not data:
         return None, (
-            "Upstox returned no quote data. "
-            "The instrument key or endpoint may need checking."
+            "No quote returned. Check the instrument key "
+            "and the Upstox API response."
         )
 
-    # Locate the returned quote without assuming
-    # the exact dictionary key format.
     quote = next(iter(data.values()), None)
 
     if not isinstance(quote, dict):
-        return None, "The quote response format was unexpected."
+        return None, "Unexpected quote response format."
 
     last_price = quote.get("last_price")
 
     if last_price is None:
-        return None, "No last price was returned by Upstox."
+        return None, "The response did not contain a last price."
 
-    return {
-        "last_price": float(last_price),
-        "raw_quote": quote
-    }, None
+    return float(last_price), None
 
 except requests.Timeout:
-    return None, "Upstox request timed out. Please try again."
+    return None, "Upstox request timed out. Try again."
 
 except requests.RequestException:
     return None, (
-        "Could not reach Upstox. Check your internet connection "
-        "and try again."
+        "Could not connect to Upstox. Check your connection."
     )
 
 except Exception:
     return None, (
-        "The quote could not be processed. Check the app "
-        "configuration and try again."
+        "Quote check failed. Check app configuration "
+        "and Streamlit Secrets."
     )
 
 if st.button("Test Upstox connection / Refresh NIFTY quote"):
@@ -121,19 +105,12 @@ if error:
     st.error(error)
 else:
     st.success("Upstox quote request succeeded.")
-    st.metric(
-        "Live NIFTY 50 quote (₹)",
-        f"{quote['last_price']:,.2f}"
-    )
-    st.caption(
-        "Retrieved from Upstox. Confirm the exchange timestamp "
-        "and market status before relying on this price."
-    )
+    st.metric("NIFTY 50 quote (₹)", f"{quote:,.2f}")
 
-st.caption(
-"The quote appears only after you press the refresh button. "
-"This is not a continuous real-time monitoring service."
-)
+    st.caption(
+        "Confirm market status and quote freshness. "
+        "This is a manual refresh, not continuous monitoring."
+    )
 
 st.divider()
 
@@ -149,7 +126,7 @@ col1, col2 = st.columns(2)
 
 with col1:
 nifty = st.number_input(
-"NIFTY spot price (manual fallback)",
+"NIFTY spot price (manual input)",
 min_value=0.0,
 value=25000.0,
 step=50.0
@@ -237,6 +214,7 @@ max_lots = int(risk_amount // loss_per_lot)
         "Estimated loss per lot",
         f"₹{loss_per_lot:,.2f}"
     )
+
     st.metric("Lots within risk budget", max_lots)
 
     if max_lots == 0:
@@ -245,8 +223,8 @@ max_lots = int(risk_amount // loss_per_lot)
         )
     else:
         st.info(
-            "Calculation only, not a trading signal. "
-            "Charges, slippage and gap risk are excluded."
+            "Planning calculation only. Charges, slippage "
+            "and gap risk are excluded."
         )
 
 --------------------------------------------------
@@ -325,7 +303,7 @@ FOOTER
 st.divider()
 
 st.caption(
-"Educational research tool. No broker order execution is "
-"implemented. Market data may be delayed or unavailable. "
-"Do not rely on this app alone to make trading decisions."
+"Educational research tool. No broker order execution "
+"is implemented. Market data may be unavailable or delayed. "
+"Do not rely on this app alone for trading decisions."
 )
