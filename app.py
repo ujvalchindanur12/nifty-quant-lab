@@ -107,19 +107,28 @@ def aggregate_bars(df, minutes):
     return out.reset_index(drop=True)
 
 def parse_chain_rows(chain_payload):
-    """Convert common Upstox option-chain response into rows."""
-    if not isinstance(chain_payload, dict):
+    """Parse Upstox v2 option-chain response (data is normally a list of strike rows)."""
+    if not isinstance(chain_payload, (dict, list)):
         return []
-    data = chain_payload.get("data", chain_payload)
-    if isinstance(data, dict):
-        # Some responses wrap rows in 'data'; others return list there.
-        rows = data.get("chain") or data.get("option_chain") or data.get("data")
-        if rows is None and all(isinstance(v, dict) for v in data.values()):
-            rows = list(data.values())
-    else:
-        rows = data
+
+    # Support both a full API response {"status": "...", "data": [...]} and
+    # a helper that already returns the data list.
+    rows = chain_payload
+    if isinstance(chain_payload, dict):
+        rows = chain_payload.get("data", chain_payload.get("chain", []))
+        # Some wrappers may nest the API response one additional level.
+        if isinstance(rows, dict):
+            rows = rows.get("data", rows.get("chain", rows.get("option_chain", [])))
+
+    if isinstance(rows, dict):
+        # Accept a single strike row as well as a list of rows.
+        if "strike_price" in rows or "strike" in rows:
+            rows = [rows]
+        else:
+            return []
     if not isinstance(rows, list):
         return []
+
     result = []
     for row in rows:
         if not isinstance(row, dict):
@@ -127,19 +136,21 @@ def parse_chain_rows(chain_payload):
         strike = safe_float(row.get("strike_price", row.get("strike")))
         if not np.isfinite(strike):
             continue
+
         item = {"strike": strike}
-        for side, aliases in [
-            ("CE", ("call_options", "ce", "call")),
-            ("PE", ("put_options", "pe", "put")),
-        ]:
-            opt = next((row.get(k) for k in aliases if isinstance(row.get(k), dict)), {})
-            market = opt.get("market_data", opt.get("marketData", {})) if isinstance(opt, dict) else {}
-            item[side + "_key"] = opt.get("instrument_key") or opt.get("instrumentKey")
+        for side, option_field in (("CE", "call_options"), ("PE", "put_options")):
+            opt = row.get(option_field, {})
+            if not isinstance(opt, dict):
+                opt = {}
+            market = opt.get("market_data", {})
+            if not isinstance(market, dict):
+                market = {}
+            item[side + "_key"] = opt.get("instrument_key")
             item[side + "_ltp"] = safe_float(market.get("ltp", market.get("last_price")))
-            item[side + "_bid"] = safe_float(market.get("bid_price", market.get("bidPrice")))
-            item[side + "_ask"] = safe_float(market.get("ask_price", market.get("askPrice")))
+            item[side + "_bid"] = safe_float(market.get("bid_price"))
+            item[side + "_ask"] = safe_float(market.get("ask_price"))
             item[side + "_volume"] = safe_float(market.get("volume"), 0)
-            item[side + "_oi"] = safe_float(market.get("oi", market.get("open_interest")), 0)
+            item[side + "_oi"] = safe_float(market.get("oi"), 0)
         result.append(item)
     return result
 
@@ -247,14 +258,14 @@ with c3:
             else:
                 bars5 = aggregate_bars(df, 5)
                 bars15 = aggregate_bars(df, 15)
+                # Use the field names defined in the existing strategy.py.
                 cfg = strategy.StrategyConfig(
-                    risk_per_trade=risk_per_trade,
+                    max_risk_per_trade=risk_per_trade,
                     daily_loss_limit=daily_loss_limit,
-                    reward_risk=2.0,
-                    ema_fast=9,
-                    ema_slow=21,
+                    reward_risk_ratio=2.0,
+                    fast_ema_period=9,
+                    slow_ema_period=21,
                     rsi_period=14,
-                    max_trades_per_day=3,
                 )
                 s5 = canonical_bias(call_strategy(bars5["close"].tolist(), cfg)) if len(bars5) >= 30 else "NO TRADE"
                 s15 = canonical_bias(call_strategy(bars15["close"].tolist(), cfg)) if len(bars15) >= 30 else "NO TRADE"
@@ -315,7 +326,14 @@ if st.session_state.expiry_dates:
             if st.session_state.chain_rows:
                 st.success(f"Loaded {len(st.session_state.chain_rows)} strike rows for {expiry}.")
             else:
-                st.error("Option chain returned, but this app could not interpret its format. Do not use a candidate until this is fixed.")
+                api_status = payload.get("status", "unknown") if isinstance(payload, dict) else "unknown"
+                api_message = payload.get("errors", payload.get("message", "")) if isinstance(payload, dict) else ""
+                st.error(
+                    f"No option-chain strike rows could be read (API status: {api_status}). "
+                    "Do not trade until this is resolved."
+                )
+                if api_message:
+                    st.caption(f"API message: {api_message}")
         except Exception as e:
             st.error(f"Option chain failed: {e}")
 else:
