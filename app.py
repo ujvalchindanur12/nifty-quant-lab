@@ -505,3 +505,53 @@ st.caption(
     "implemented. Data may be delayed, stale, or unavailable. "
     "This app is not a continuous monitor."
 )
+
+def get_historical_candles(
+    instrument_key,
+    interval="1minute",
+    to_date=None,
+    from_date=None,
+):
+    """
+    Fetch historical candles from Upstox.
+
+    Dates must be YYYY-MM-DD strings.
+    Use only intervals supported by the Upstox API.
+    """
+    from urllib.parse import quote
+
+    if not instrument_key:
+        raise ValueError("Instrument key is required.")
+
+    if not to_date or not from_date:
+        raise ValueError(
+            "Provide from_date and to_date in YYYY-MM-DD format."
+        )
+
+    allowed_intervals = {
+        "1minute", "30minute", "day", "week", "month"
+    }
+
+    if interval not in allowed_intervals:
+        raise ValueError("Unsupported candle interval.")
+
+    key = quote(instrument_key, safe="")
+    endpoint = (
+        f"https://api.upstox.com/v3/historical-candle/"
+        f"{key}/{interval}/{to_date}/{from_date}"
+    )
+
+    response = requests.get(
+        endpoint,
+        headers=get_headers(),
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    if payload.get("status") != "success":
+        raise ValueError(
+            str(payload.get("errors", "Historical candle request failed"))
+        )
+
+    return payload.get("data", {}).get("candles", [])
