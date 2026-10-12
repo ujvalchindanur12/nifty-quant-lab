@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import api
+import strategy
 from datetime import date, datetime
 
 # ==========================================
