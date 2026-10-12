@@ -1,686 +1,411 @@
-
 import streamlit as st
 import pandas as pd
+import numpy as np
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 import api
 import strategy
 
-from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+# NIFTY Quant Lab — manual decision support only.
+# This app NEVER places orders. Verify every value in your broker app before buying.
 
-
-# =========================================================
-# NIFTY QUANT LAB — MANUAL TRADING RESEARCH
-# NO AUTOMATED ORDER PLACEMENT
-# =========================================================
-
-st.set_page_config(
-    page_title="NIFTY Quant Lab",
-    page_icon="📈",
-    layout="wide",
-)
-
-NIFTY_KEY = "NSE_INDEX|Nifty 50"
+st.set_page_config(page_title="NIFTY Quant Lab", page_icon="📈", layout="wide")
 IST = ZoneInfo("Asia/Kolkata")
-
+NIFTY_KEY = "NSE_INDEX|Nifty 50"
 CAPITAL_DEFAULT = 25000.0
-RISK_DEFAULT = 500.0
-DAILY_LOSS_LIMIT = 1000.0
+MAX_RISK_DEFAULT = 500.0
+MAX_DAILY_LOSS_DEFAULT = 1000.0
 
 st.title("📈 NIFTY Quant Lab")
-st.caption("NIFTY options research • Manual execution only")
+st.caption("Manual trading decision support • No automatic order placement")
 
 st.warning(
-    "RESEARCH MODE: This app never places orders. "
-    "Signals are experimental and are not guaranteed to be profitable."
+    "Important: this is an experimental indicator, not a proven profitable strategy. "
+    "A green status is a checklist result, not a guarantee. Confirm the contract, live premium, "
+    "spread and order details in Upstox/Angel One before placing any manual order."
 )
 
-
-# =========================================================
-# SESSION STATE
-# =========================================================
-
-defaults = {
-    "nifty_spot": None,
-    "quote_time": None,
-    "expiry_dates": [],
-    "option_chain": None,
-    "chain_expiry": None,
-    "candles": None,
-    "analysis_time": None,
-}
-
-for key, default in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def number(value):
+def safe_float(value, default=np.nan):
     try:
         if value is None:
-            return None
-        result = float(value)
-        if pd.isna(result):
-            return None
-        return result
-    except (ValueError, TypeError):
-        return None
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
+def get_quote_price(payload):
+    """Handle common Upstox market-quote response shapes."""
+    if not isinstance(payload, dict):
+        return np.nan
+    data = payload.get("data", payload)
+    if isinstance(data, dict):
+        for key, item in data.items():
+            if isinstance(item, dict):
+                for field in ("last_price", "ltp", "close_price"):
+                    val = safe_float(item.get(field))
+                    if np.isfinite(val):
+                        return val
+        for field in ("last_price", "ltp", "close_price"):
+            val = safe_float(data.get(field))
+            if np.isfinite(val):
+                return val
+    return np.nan
 
-def get_quote():
-    data = api.get_market_quote(NIFTY_KEY)
-
-    if not isinstance(data, dict) or not data:
-        raise ValueError("No NIFTY quote returned.")
-
-    item = next(iter(data.values()))
-    price = number(item.get("last_price"))
-
-    if price is None or price <= 0:
-        raise ValueError("Invalid NIFTY quote.")
-
-    return price
-
-
-def candle_frame(candles):
-    if not candles:
-        raise ValueError("No historical candles returned.")
-
-    columns = [
-        "timestamp", "open", "high", "low",
-        "close", "volume", "open_interest",
-    ]
-
-    frame = pd.DataFrame(candles, columns=columns)
-
-    frame["timestamp"] = pd.to_datetime(
-        frame["timestamp"], errors="coerce", utc=True
-    ).dt.tz_convert("Asia/Kolkata")
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        frame[col] = pd.to_numeric(frame[col], errors="coerce")
-
-    frame = frame.dropna(
-        subset=["timestamp", "open", "high", "low", "close"]
-    )
-
-    frame = frame.sort_values("timestamp")
-    frame = frame.drop_duplicates("timestamp", keep="last")
-    return frame.set_index("timestamp")
-
-
-def aggregate_bars(frame, minutes):
-    """Aggregate one-minute candles and exclude incomplete bars."""
-    if frame is None or frame.empty:
+def normalize_candles(payload):
+    if isinstance(payload, pd.DataFrame):
+        df = payload.copy()
+    else:
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        candles = data.get("candles", []) if isinstance(data, dict) else data
+        if not candles:
+            return pd.DataFrame()
+        # Upstox candle format: [timestamp, open, high, low, close, volume, oi]
+        df = pd.DataFrame(candles)
+        if df.shape[1] >= 6:
+            df = df.iloc[:, :6]
+            df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        elif df.shape[1] >= 5:
+            df = df.iloc[:, :5]
+            df.columns = ["timestamp", "open", "high", "low", "close"]
+    if df.empty:
+        return df
+    # Support either named columns or positional columns.
+    lower = {str(c).lower(): c for c in df.columns}
+    required = ["timestamp", "open", "high", "low", "close"]
+    if not all(x in lower for x in required):
         return pd.DataFrame()
+    df = df.rename(columns={lower[k]: k for k in lower})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "volume" not in df:
+        df["volume"] = 0
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
-    now = pd.Timestamp.now(tz="Asia/Kolkata")
-
-    complete = frame[
-        frame.index + pd.Timedelta(minutes=1) <= now
-    ].copy()
-
-    if complete.empty:
+def aggregate_bars(df, minutes):
+    if df.empty:
         return pd.DataFrame()
-
-    bars = complete.resample(
-        f"{minutes}min",
-        origin="start_day",
-    ).agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    })
-
-    bars = bars[
-        bars.index + pd.Timedelta(minutes=minutes) <= now
+    x = df.copy().set_index("timestamp")
+    rule = f"{minutes}min"
+    out = x.resample(rule, origin="start_day", offset="15min", label="left", closed="left").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    ).dropna(subset=["open", "high", "low", "close"]).reset_index()
+    # Remove the currently forming candle, and candles outside today's session for signal use.
+    now = datetime.now(IST)
+    out = out[out["timestamp"] + timedelta(minutes=minutes) <= now]
+    out = out[
+        (out["timestamp"].dt.time >= datetime.strptime("09:15", "%H:%M").time())
+        & (out["timestamp"].dt.time < datetime.strptime("15:30", "%H:%M").time())
     ]
+    return out.reset_index(drop=True)
 
-    return bars.dropna(
-        subset=["open", "high", "low", "close"]
-    )
+def parse_chain_rows(chain_payload):
+    """Convert common Upstox option-chain response into rows."""
+    if not isinstance(chain_payload, dict):
+        return []
+    data = chain_payload.get("data", chain_payload)
+    if isinstance(data, dict):
+        # Some responses wrap rows in 'data'; others return list there.
+        rows = data.get("chain") or data.get("option_chain") or data.get("data")
+        if rows is None and all(isinstance(v, dict) for v in data.values()):
+            rows = list(data.values())
+    else:
+        rows = data
+    if not isinstance(rows, list):
+        return []
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        strike = safe_float(row.get("strike_price", row.get("strike")))
+        if not np.isfinite(strike):
+            continue
+        item = {"strike": strike}
+        for side, aliases in [
+            ("CE", ("call_options", "ce", "call")),
+            ("PE", ("put_options", "pe", "put")),
+        ]:
+            opt = next((row.get(k) for k in aliases if isinstance(row.get(k), dict)), {})
+            market = opt.get("market_data", opt.get("marketData", {})) if isinstance(opt, dict) else {}
+            item[side + "_key"] = opt.get("instrument_key") or opt.get("instrumentKey")
+            item[side + "_ltp"] = safe_float(market.get("ltp", market.get("last_price")))
+            item[side + "_bid"] = safe_float(market.get("bid_price", market.get("bidPrice")))
+            item[side + "_ask"] = safe_float(market.get("ask_price", market.get("askPrice")))
+            item[side + "_volume"] = safe_float(market.get("volume"), 0)
+            item[side + "_oi"] = safe_float(market.get("oi", market.get("open_interest")), 0)
+        result.append(item)
+    return result
 
+def spread_pct(bid, ask):
+    if not np.isfinite(bid) or not np.isfinite(ask) or bid <= 0 or ask <= 0:
+        return np.nan
+    mid = (bid + ask) / 2
+    return ((ask - bid) / mid) * 100 if mid > 0 else np.nan
 
-def spread_percent(bid, ask):
-    bid = number(bid)
-    ask = number(ask)
-
-    if (
-        bid is None or ask is None
-        or bid <= 0 or ask <= 0 or ask < bid
-    ):
-        return None
-
-    midpoint = (bid + ask) / 2
-
-    if midpoint <= 0:
-        return None
-
-    return 100 * (ask - bid) / midpoint
-
-
-def liquidity_status(row, side):
-    ltp = number(row.get(f"{side} LTP"))
-    bid = number(row.get(f"{side} Bid"))
-    ask = number(row.get(f"{side} Ask"))
-    volume = number(row.get(f"{side} Volume"))
-    spread = spread_percent(bid, ask)
-
-    problems = []
-
-    if ltp is None or ltp <= 0:
-        problems.append("Missing LTP")
-
-    if spread is None:
-        problems.append("Invalid bid/ask")
-    elif spread > 5:
-        problems.append("Spread above 5%")
-
-    if volume is None or volume <= 0:
-        problems.append("No reported volume")
-
-    return (
-        "CHECK: " + ", ".join(problems)
-        if problems else "Basic checks passed"
-    )
-
-
-# =========================================================
-# 1. LIVE QUOTE
-# =========================================================
-
-st.header("1. NIFTY Market Data")
-
-if st.button("Refresh NIFTY Quote"):
+def call_strategy(closes, cfg):
     try:
-        with st.spinner("Requesting NIFTY quote..."):
-            st.session_state["nifty_spot"] = get_quote()
-            st.session_state["quote_time"] = datetime.now(
-                IST
-            ).strftime("%Y-%m-%d %H:%M:%S IST")
+        result = strategy.calculate_signal(closes, cfg)
+        if isinstance(result, dict):
+            return str(result.get("bias", result.get("signal", result.get("status", "NO TRADE")))).upper()
+        if hasattr(result, "bias"):
+            return str(result.bias).upper()
+        return str(result).upper()
+    except Exception:
+        return "NO TRADE"
 
-        st.success("Quote refreshed.")
+def canonical_bias(value):
+    s = str(value).upper()
+    if "CE" in s and "NO TRADE" not in s:
+        return "CE BIAS"
+    if "PE" in s and "NO TRADE" not in s:
+        return "PE BIAS"
+    return "NO TRADE"
 
-    except Exception as exc:
-        st.error(f"Quote request failed: {exc}")
+with st.sidebar:
+    st.header("Risk settings")
+    capital = st.number_input("Available capital (₹)", min_value=1000.0, value=CAPITAL_DEFAULT, step=1000.0)
+    risk_per_trade = st.number_input("Maximum planned risk per trade (₹)", min_value=50.0, max_value=500.0, value=MAX_RISK_DEFAULT, step=50.0)
+    daily_loss_limit = st.number_input("Daily loss limit (₹)", min_value=100.0, max_value=2500.0, value=MAX_DAILY_LOSS_DEFAULT, step=100.0)
+    lot_size = st.number_input("NIFTY lot size — verify with broker", min_value=1, value=65, step=1)
+    st.caption("Do not assume the lot size is current. Verify it with your broker.")
 
-spot = st.session_state["nifty_spot"]
+if "spot" not in st.session_state:
+    st.session_state.spot = np.nan
+if "expiry_dates" not in st.session_state:
+    st.session_state.expiry_dates = []
+if "chain_rows" not in st.session_state:
+    st.session_state.chain_rows = []
+if "chain_expiry" not in st.session_state:
+    st.session_state.chain_expiry = None
+if "candles" not in st.session_state:
+    st.session_state.candles = pd.DataFrame()
+if "analysis" not in st.session_state:
+    st.session_state.analysis = None
 
-if spot is not None:
-    st.metric("Last fetched NIFTY 50", f"₹{spot:,.2f}")
-    st.caption(
-        f"Quote time: {st.session_state['quote_time']}. "
-        "Refresh manually; this is not a continuous live feed."
-    )
-else:
-    st.info("Refresh the NIFTY quote to begin.")
-
-
-# =========================================================
-# 2. OPTION EXPIRIES AND CHAIN
-# =========================================================
-
-st.divider()
-st.header("2. Option Chain")
-
-if st.button("Load Expiry Dates"):
-    try:
-        with st.spinner("Loading expiry dates..."):
-            st.session_state["expiry_dates"] = api.get_expiry_dates(
-                NIFTY_KEY
-            )
-
-        if st.session_state["expiry_dates"]:
-            st.success(
-                f"Loaded {len(st.session_state['expiry_dates'])} expiries."
-            )
-        else:
-            st.warning("No future expiries returned.")
-
-    except Exception as exc:
-        st.error(f"Expiry request failed: {exc}")
-
-expiries = st.session_state["expiry_dates"]
-
-if expiries:
-    selected_expiry = st.selectbox(
-        "Select expiry",
-        expiries,
-        key="selected_expiry",
-    )
-
-    if st.button("Fetch Option Chain"):
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("1. Refresh NIFTY quote", use_container_width=True):
         try:
-            with st.spinner("Fetching option chain..."):
-                chain = api.get_option_chain(
-                    NIFTY_KEY, selected_expiry
-                )
-
-            if not isinstance(chain, list) or not chain:
-                st.session_state["option_chain"] = None
-                st.warning("No option-chain rows returned.")
+            q = api.get_market_quote([NIFTY_KEY])
+            price = get_quote_price(q)
+            if np.isfinite(price):
+                st.session_state.spot = price
+                st.session_state.quote_time = datetime.now(IST)
+                st.success(f"NIFTY quote fetched: {price:.2f}")
             else:
-                st.session_state["option_chain"] = chain
-                st.session_state["chain_expiry"] = selected_expiry
-                st.success(f"Loaded {len(chain)} strike rows.")
+                st.error("Could not read NIFTY price from the API response. Check the API token and quote endpoint.")
+        except Exception as e:
+            st.error(f"NIFTY quote failed: {e}")
 
-        except Exception as exc:
-            st.error(f"Option-chain request failed: {exc}")
+with c2:
+    if st.button("2. Load expiry dates", use_container_width=True):
+        try:
+            response = api.get_expiry_dates(instrument_key=NIFTY_KEY, include_expired=False)
+            data = response.get("data", response) if isinstance(response, dict) else response
+            dates = []
+            if isinstance(data, list):
+                for x in data:
+                    if isinstance(x, str):
+                        dates.append(x)
+                    elif isinstance(x, dict):
+                        val = x.get("expiry") or x.get("expiry_date") or x.get("date")
+                        if val:
+                            dates.append(str(val)[:10])
+            elif isinstance(data, dict):
+                dates = [str(v)[:10] for v in data.get("expiry_dates", [])]
+            st.session_state.expiry_dates = sorted(set(dates))
+            if not st.session_state.expiry_dates:
+                st.warning("Expiry dates were returned in an unexpected format. Check api.py response handling.")
+            else:
+                st.success(f"Loaded {len(st.session_state.expiry_dates)} expiry date(s).")
+        except Exception as e:
+            st.error(f"Expiry lookup failed: {e}")
 
-chain = st.session_state["option_chain"]
-df = pd.DataFrame()
-
-if chain:
-    rows = []
-
-    for item in chain:
-        call = item.get("call_options") or {}
-        put = item.get("put_options") or {}
-
-        cm = call.get("market_data") or {}
-        pm = put.get("market_data") or {}
-
-        cg = call.get("option_greeks") or {}
-        pg = put.get("option_greeks") or {}
-
-        rows.append({
-            "Strike": number(item.get("strike_price")),
-            "Call LTP": number(cm.get("ltp")),
-            "Call Bid": number(cm.get("bid_price")),
-            "Call Ask": number(cm.get("ask_price")),
-            "Call Volume": number(cm.get("volume")),
-            "Call OI": number(cm.get("oi")),
-            "Call IV": number(cg.get("iv")),
-            "Put LTP": number(pm.get("ltp")),
-            "Put Bid": number(pm.get("bid_price")),
-            "Put Ask": number(pm.get("ask_price")),
-            "Put Volume": number(pm.get("volume")),
-            "Put OI": number(pm.get("oi")),
-            "Put IV": number(pg.get("iv")),
-        })
-
-    df = pd.DataFrame(rows).dropna(subset=["Strike"])
-    df = df.sort_values("Strike")
-
-    st.caption(f"Expiry: {st.session_state['chain_expiry']}")
-
-    if spot is not None and not df.empty:
-        strikes = sorted(df["Strike"].unique())
-        atm = min(strikes, key=lambda x: abs(x - spot))
-        atm_index = strikes.index(atm)
-        nearby_strikes = strikes[
-            max(0, atm_index - 5): min(len(strikes), atm_index + 6)
-        ]
-
-        nearby = df[df["Strike"].isin(nearby_strikes)].copy()
-
-        nearby["Call Liquidity"] = nearby.apply(
-            lambda row: liquidity_status(row, "Call"), axis=1
-        )
-        nearby["Put Liquidity"] = nearby.apply(
-            lambda row: liquidity_status(row, "Put"), axis=1
-        )
-
-        st.metric("Approximate ATM Strike", f"{atm:g}")
-        st.dataframe(
-            nearby,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.download_button(
-            "Download Option Chain CSV",
-            data=nearby.to_csv(index=False),
-            file_name="nifty_nearby_strikes.csv",
-            mime="text/csv",
-        )
-
-
-# =========================================================
-# 3. MULTI-TIMEFRAME SIGNAL ANALYSIS
-# =========================================================
-
-st.divider()
-st.header("3. Strategy Signal")
-
-st.write(
-    "Entry research uses completed 5-minute candles and confirmation "
-    "uses completed 15-minute candles. The indicators are experimental."
-)
-
-lookback_days = st.selectbox(
-    "Historical data lookback",
-    [7, 14, 30],
-    index=1,
-)
-
-if st.button("Fetch Candles and Analyse"):
-    try:
-        end_day = date.today()
-        start_day = end_day - timedelta(days=lookback_days)
-
-        with st.spinner("Fetching historical candles..."):
-            candles = api.get_historical_candles(
+with c3:
+    if st.button("3. Fetch candles & analyse", use_container_width=True):
+        try:
+            end = date.today()
+            start = end - timedelta(days=14)
+            raw = api.get_historical_candles(
                 instrument_key=NIFTY_KEY,
                 interval="1minute",
-                from_date=start_day.isoformat(),
-                to_date=end_day.isoformat(),
+                to_date=end.isoformat(),
+                from_date=start.isoformat(),
             )
+            df = normalize_candles(raw)
+            st.session_state.candles = df
+            if df.empty:
+                st.session_state.analysis = None
+                st.error("No usable candle data returned.")
+            else:
+                bars5 = aggregate_bars(df, 5)
+                bars15 = aggregate_bars(df, 15)
+                cfg = strategy.StrategyConfig(
+                    risk_per_trade=risk_per_trade,
+                    daily_loss_limit=daily_loss_limit,
+                    reward_risk=2.0,
+                    ema_fast=9,
+                    ema_slow=21,
+                    rsi_period=14,
+                    max_trades_per_day=3,
+                )
+                s5 = canonical_bias(call_strategy(bars5["close"].tolist(), cfg)) if len(bars5) >= 30 else "NO TRADE"
+                s15 = canonical_bias(call_strategy(bars15["close"].tolist(), cfg)) if len(bars15) >= 30 else "NO TRADE"
+                combined = s5 if s5 == s15 and s5 != "NO TRADE" else "NO TRADE"
+                last_ts = bars5["timestamp"].max() if not bars5.empty else pd.NaT
+                now = datetime.now(IST)
+                fresh = False
+                if pd.notna(last_ts):
+                    age = (now - last_ts.to_pydatetime()).total_seconds() / 60
+                    fresh = age <= 15 and now.time() >= datetime.strptime("09:15", "%H:%M").time() and now.time() <= datetime.strptime("15:30", "%H:%M").time()
+                st.session_state.analysis = {
+                    "5m": s5, "15m": s15, "combined": combined,
+                    "last_candle": last_ts, "fresh": fresh,
+                    "bars5": bars5, "bars15": bars15,
+                    "analysis_time": now,
+                }
+                st.success(f"Analysis complete. 5m: {s5} | 15m: {s15} | Combined: {combined}")
+        except Exception as e:
+            st.session_state.analysis = None
+            st.error(f"Analysis failed: {e}")
 
-        frame = candle_frame(candles)
-
-        if frame.empty:
-            raise ValueError("No usable candles returned.")
-
-        st.session_state["candles"] = frame
-        st.session_state["analysis_time"] = datetime.now(
-            IST
-        ).strftime("%Y-%m-%d %H:%M:%S IST")
-
-        st.success(f"Loaded {len(frame)} one-minute candles.")
-
-    except Exception as exc:
-        st.error(f"Analysis request failed: {exc}")
-
-frame = st.session_state["candles"]
-
-combined_signal = "NO TRADE"
-combined_reason = "Fetch and validate historical candles first."
-signal5 = None
-signal15 = None
-
-if frame is not None:
-    bars5 = aggregate_bars(frame, 5)
-    bars15 = aggregate_bars(frame, 15)
-
-    col1, col2 = st.columns(2)
-    col1.metric("Completed 5-minute bars", len(bars5))
-    col2.metric("Completed 15-minute bars", len(bars15))
-
-    st.caption(
-        f"Analysis requested: {st.session_state['analysis_time']}"
-    )
-
-    # Require enough bars for the 21-period EMA and RSI.
-    if len(bars5) < 30 or len(bars15) < 30:
-        combined_reason = "Insufficient completed candles."
-        st.warning(
-            "Insufficient candle history. No signal will be generated."
-        )
-    else:
-        config = strategy.StrategyConfig(
-            max_risk_per_trade=RISK_DEFAULT,
-            daily_loss_limit=DAILY_LOSS_LIMIT,
-            reward_risk_ratio=2.0,
-            fast_ema_period=9,
-            slow_ema_period=21,
-            rsi_period=14,
-            max_trades_per_day=3,
-        )
-
-        signal5 = strategy.calculate_signal(
-            bars5["close"].tolist(), config
-        )
-        signal15 = strategy.calculate_signal(
-            bars15["close"].tolist(), config
-        )
-
-        st.subheader("Indicator confirmation")
-
-        results = pd.DataFrame([
-            {
-                "Timeframe": "5-minute entry",
-                "Bias": signal5["signal"],
-                "EMA 9": signal5["fast_ema"],
-                "EMA 21": signal5["slow_ema"],
-                "RSI": signal5["rsi"],
-                "Reason": signal5["reason"],
-            },
-            {
-                "Timeframe": "15-minute confirmation",
-                "Bias": signal15["signal"],
-                "EMA 9": signal15["fast_ema"],
-                "EMA 21": signal15["slow_ema"],
-                "RSI": signal15["rsi"],
-                "Reason": signal15["reason"],
-            },
-        ])
-
-        st.dataframe(
-            results,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        if (
-            signal5["signal"] == "CE BIAS"
-            and signal15["signal"] == "CE BIAS"
-        ):
-            combined_signal = "CE BIAS"
-            combined_reason = (
-                "Both timeframes show a bullish indicator bias. "
-                "This is not a verified buy signal."
-            )
-
-        elif (
-            signal5["signal"] == "PE BIAS"
-            and signal15["signal"] == "PE BIAS"
-        ):
-            combined_signal = "PE BIAS"
-            combined_reason = (
-                "Both timeframes show a bearish indicator bias. "
-                "This is not a verified buy signal."
-            )
-
-        else:
-            combined_signal = "NO TRADE"
-            combined_reason = (
-                "Timeframes disagree or the entry conditions are not met."
-            )
-
-st.subheader("Combined result")
-st.metric("Strategy status", combined_signal)
-st.write(combined_reason)
-
-if frame is not None:
-    st.subheader("Recent completed 5-minute candles")
-    st.dataframe(
-        bars5.tail(20).reset_index(),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-# =========================================================
-# 4. OPTION LIQUIDITY AND PREMIUM REFERENCE
-# =========================================================
-
-st.divider()
-st.header("4. Option Reference")
-
-if df.empty or spot is None:
-    st.info("Refresh the quote and fetch the option chain first.")
+if np.isfinite(st.session_state.spot):
+    st.metric("Latest NIFTY quote", f"{st.session_state.spot:,.2f}",
+              help="Refresh the quote during market hours. Confirm it against your broker.")
+    qt = st.session_state.get("quote_time")
+    if qt:
+        st.caption("Quote fetched at " + qt.strftime("%d %b %Y, %I:%M:%S %p IST"))
 else:
-    strikes = sorted(df["Strike"].unique())
-    atm = min(strikes, key=lambda x: abs(x - spot))
-    atm_row = df.loc[
-        (df["Strike"] - atm).abs().idxmin()
-    ]
+    st.info("Tap **1. Refresh NIFTY quote** to fetch the latest available index quote.")
 
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.subheader("ATM Call")
-        st.write(f"Strike: {atm:g}")
-        st.write(f"LTP: ₹{atm_row['Call LTP']}" if pd.notna(
-            atm_row["Call LTP"]
-        ) else "LTP unavailable")
-
-        call_spread = spread_percent(
-            atm_row["Call Bid"], atm_row["Call Ask"]
-        )
-
-        st.write(
-            f"Bid/ask spread: {call_spread:.2f}%"
-            if call_spread is not None
-            else "Bid/ask spread unavailable"
-        )
-        st.write(
-            liquidity_status(atm_row, "Call")
-        )
-
-    with c2:
-        st.subheader("ATM Put")
-        st.write(f"Strike: {atm:g}")
-        st.write(f"LTP: ₹{atm_row['Put LTP']}" if pd.notna(
-            atm_row["Put LTP"]
-        ) else "LTP unavailable")
-
-        put_spread = spread_percent(
-            atm_row["Put Bid"], atm_row["Put Ask"]
-        )
-
-        st.write(
-            f"Bid/ask spread: {put_spread:.2f}%"
-            if put_spread is not None
-            else "Bid/ask spread unavailable"
-        )
-        st.write(
-            liquidity_status(atm_row, "Put")
-        )
-
-    st.caption(
-        "These are ATM references, not necessarily the best contract. "
-        "Option-chain quotes may be stale. Verify the chosen contract "
-        "and price in your broker app before deciding."
-    )
-
-
-# =========================================================
-# 5. MANUAL TRADE RISK CALCULATOR
-# =========================================================
-
-st.divider()
-st.header("5. Manual Options Risk Calculator")
-
-st.write(
-    "Enter a proposed long-option trade. This estimates risk and "
-    "position size; it does not place an order."
-)
-
-capital = st.number_input(
-    "Available capital (₹)",
-    min_value=0.0,
-    value=CAPITAL_DEFAULT,
-    step=1000.0,
-)
-
-risk_limit = st.number_input(
-    "Maximum planned risk per trade (₹)",
-    min_value=1.0,
-    max_value=RISK_DEFAULT,
-    value=RISK_DEFAULT,
-    step=50.0,
-)
-
-option_side = st.selectbox(
-    "Option side",
-    ["CE", "PE"],
-)
-
-proposed_strike = st.number_input(
-    "Proposed strike",
-    min_value=1.0,
-    value=float(
-        min(df["Strike"], key=lambda x: abs(x - spot))
-        if spot is not None and not df.empty
-        else 25000.0
-    ),
-    step=50.0,
-)
-
-entry = st.number_input(
-    "Proposed entry premium (₹)",
-    min_value=0.05,
-    value=100.0,
-    step=1.0,
-)
-
-stop = st.number_input(
-    "Stop-loss premium (₹)",
-    min_value=0.01,
-    value=80.0,
-    step=1.0,
-)
-
-lot_size = st.number_input(
-    "Current exchange lot size — verify before use",
-    min_value=1,
-    value=65,
-    step=1,
-)
-
-if st.button("Calculate Position and Risk"):
-    if stop >= entry:
-        st.error("For a long option, stop-loss must be below entry.")
+st.subheader("Strategy confirmation")
+if st.session_state.analysis:
+    a = st.session_state.analysis
+    m1, m2, m3 = st.columns(3)
+    m1.metric("5-minute entry", a["5m"])
+    m2.metric("15-minute confirmation", a["15m"])
+    m3.metric("Combined result", a["combined"])
+    if pd.notna(a["last_candle"]):
+        st.write("Last completed 5-minute candle:", a["last_candle"].strftime("%d %b %Y, %I:%M %p %Z"))
+    if not a["fresh"]:
+        st.error("STALE / OUT-OF-SESSION DATA: no trade candidate will be approved. Refresh during regular market hours.")
+    elif a["combined"] == "NO TRADE":
+        st.warning("NO TRADE: the two timeframes do not agree or entry conditions are not met. Do not force an entry.")
     else:
-        risk_per_lot = (entry - stop) * int(lot_size)
-        cost_per_lot = entry * int(lot_size)
+        st.info("Directional bias is aligned. The option candidate still must pass live quote, liquidity, premium and risk checks.")
+else:
+    st.info("Fetch candles and analyse to calculate the 5-minute and 15-minute signals.")
 
-        if risk_per_lot <= 0 or cost_per_lot <= 0:
-            st.error("Invalid position inputs.")
-        else:
-            lots_by_risk = int(risk_limit // risk_per_lot)
-            lots_by_capital = int(capital // cost_per_lot)
-            lots = min(lots_by_risk, lots_by_capital)
+st.subheader("Option expiry and chain")
+expiry = None
+if st.session_state.expiry_dates:
+    expiry = st.selectbox("Choose expiry", st.session_state.expiry_dates)
+    if st.button("4. Fetch selected option chain", use_container_width=True):
+        try:
+            payload = api.get_option_chain(instrument_key=NIFTY_KEY, expiry_date=expiry)
+            st.session_state.chain_rows = parse_chain_rows(payload)
+            st.session_state.chain_expiry = expiry
+            if st.session_state.chain_rows:
+                st.success(f"Loaded {len(st.session_state.chain_rows)} strike rows for {expiry}.")
+            else:
+                st.error("Option chain returned, but this app could not interpret its format. Do not use a candidate until this is fixed.")
+        except Exception as e:
+            st.error(f"Option chain failed: {e}")
+else:
+    st.caption("Load expiry dates first.")
 
-            if lots < 1:
-                st.error(
-                    "NO TRADE: one lot exceeds the selected risk "
-                    "limit or available capital."
+# Clear, conservative candidate logic.
+st.subheader("Manual trade decision")
+if not st.session_state.analysis:
+    st.warning("WAIT — run strategy analysis first.")
+elif not st.session_state.analysis["fresh"]:
+    st.error("DO NOT BUY FROM THIS DASHBOARD: candle data is stale or outside regular market hours.")
+elif st.session_state.analysis["combined"] == "NO TRADE":
+    st.error("NO TRADE — the strategy has not confirmed a direction.")
+elif not np.isfinite(st.session_state.spot):
+    st.warning("WAIT — refresh the NIFTY quote before selecting a contract.")
+elif not st.session_state.chain_rows or not st.session_state.chain_expiry:
+    st.warning("WAIT — load the option chain for the selected expiry.")
+else:
+    rows = pd.DataFrame(st.session_state.chain_rows)
+    if rows.empty:
+        st.warning("WAIT — no option strikes were parsed.")
+    else:
+        spot = float(st.session_state.spot)
+        rows["distance"] = (rows["strike"] - spot).abs()
+        nearest = rows.sort_values("distance").iloc[0]
+        direction = st.session_state.analysis["combined"]
+        side = "CE" if direction == "CE BIAS" else "PE"
+        strike = float(nearest["strike"])
+        key = nearest.get(side + "_key")
+        premium = safe_float(nearest.get(side + "_ltp"))
+        bid = safe_float(nearest.get(side + "_bid"))
+        ask = safe_float(nearest.get(side + "_ask"))
+        volume = safe_float(nearest.get(side + "_volume"), 0)
+        spread = spread_pct(bid, ask)
+        st.write(f"Nearest-to-ATM candidate: **NIFTY {strike:.0f} {side}**, expiry **{st.session_state.chain_expiry}**")
+        st.caption("ATM is only a starting candidate; it is not automatically the best option to buy.")
+        if np.isfinite(premium) and premium > 0:
+            # Conservative illustrative premium stop: 25% below entry; 2R target.
+            entry = ask if np.isfinite(ask) and ask > 0 else premium
+            stop = round(entry * 0.75, 2)
+            target = round(entry + 2 * (entry - stop), 2)
+            risk_per_unit = entry - stop
+            max_units_by_risk = int(risk_per_trade // risk_per_unit) if risk_per_unit > 0 else 0
+            max_lots = max_units_by_risk // int(lot_size)
+            lots_by_capital = int(capital // (entry * int(lot_size)))
+            lots = max(0, min(max_lots, lots_by_capital))
+            quantity = lots * int(lot_size)
+            estimated_cost = quantity * entry
+            estimated_risk = quantity * risk_per_unit
+            checks = {
+                "Correct contract key present": isinstance(key, str) and bool(key),
+                "Option quote appears live": np.isfinite(premium) and premium > 0,
+                "Bid and ask available": np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid,
+                "Bid/ask spread <= 2%": np.isfinite(spread) and spread <= 2.0,
+                "Some traded volume": volume > 0,
+                "Risk-based quantity is at least one lot": lots >= 1,
+            }
+            st.markdown("#### Candidate levels (calculated, not guaranteed)")
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Buy-limit reference (ask)", f"₹{entry:.2f}")
+            a2.metric("Illustrative stop-loss", f"₹{stop:.2f}")
+            a3.metric("Illustrative target (2R)", f"₹{target:.2f}")
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Lots", str(lots))
+            b2.metric("Quantity", str(quantity))
+            b3.metric("Estimated risk", f"₹{estimated_risk:,.0f}")
+            st.caption(f"Estimated premium outlay: ₹{estimated_cost:,.0f}. Excludes charges, slippage and gap risk. Lot size entered: {int(lot_size)}.")
+            st.markdown("#### Buy checklist")
+            for label, ok in checks.items():
+                st.write(("✅ " if ok else "❌ ") + label)
+            all_ok = all(checks.values()) and st.session_state.analysis["fresh"] and direction in ("CE BIAS", "PE BIAS")
+            if all_ok:
+                st.success(
+                    f"CHECKLIST PASSED — candidate is NIFTY {strike:.0f} {side} ({st.session_state.chain_expiry}). "
+                    f"Reference premium ₹{entry:.2f}; illustrative stop ₹{stop:.2f}; target ₹{target:.2f}. "
+                    "This is not a guaranteed buy signal. Recheck the live quote and levels in your broker app before manually placing any order."
                 )
             else:
-                quantity = lots * int(lot_size)
-                premium_cost = entry * quantity
-                planned_risk = (entry - stop) * quantity
-                target = entry + 2 * (entry - stop)
+                st.error("NOT APPROVED — at least one quote, liquidity or risk check failed. Do not buy from this result.")
+        else:
+            st.error("No valid option premium was returned for the candidate. Do not trade until the option-chain data is fixed.")
 
-                st.metric("Lots within limits", lots)
-                st.metric("Total quantity", quantity)
-                st.metric(
-                    "Estimated premium cost",
-                    f"₹{premium_cost:,.2f}",
-                )
-                st.metric(
-                    "Estimated planned risk",
-                    f"₹{planned_risk:,.2f}",
-                )
-                st.metric(
-                    "Illustrative 2R target premium",
-                    f"₹{target:,.2f}",
-                )
-
-                st.warning(
-                    "This is a mathematical estimate, not an order "
-                    "recommendation. Actual losses can exceed planned "
-                    "risk because of gaps, slippage, charges, or failed "
-                    "stop execution. Verify current lot size and contract "
-                    "details with your broker."
-                )
-
-
-# =========================================================
-# FOOTER
-# =========================================================
+st.subheader("Recent completed 5-minute candles")
+if st.session_state.analysis and not st.session_state.analysis["bars5"].empty:
+    st.dataframe(st.session_state.analysis["bars5"].tail(10).sort_values("timestamp", ascending=False), use_container_width=True)
+elif not st.session_state.candles.empty:
+    st.caption("Raw candles loaded, but no valid completed 5-minute bars were available in the current session.")
 
 st.divider()
 st.caption(
-    "NIFTY Quant Lab — research dashboard for manual decision-making. "
-    "No live order placement. Indicators are experimental and "
-    "have not been proven profitable. Never trade solely from a signal."
+    "Risk note: the stop/target shown here are mechanical examples based on the option premium, not validated support/resistance. "
+    "Options can gap through stops and lose most or all of their value. This app does not send orders and does not establish profitability."
 )
