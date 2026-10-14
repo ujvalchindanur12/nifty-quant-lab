@@ -244,14 +244,33 @@ with c3:
         try:
             end = date.today()
             start = end - timedelta(days=14)
-            raw = api.get_historical_candles(
+
+            # Fetch current-session candles separately; historical candles alone
+            # must never be treated as proof that today's data is fresh.
+            intraday_error = None
+            try:
+                raw_today = api.get_intraday_candles(
+                    instrument_key=NIFTY_KEY,
+                    interval="1minute",
+                )
+                df_today = normalize_candles(raw_today)
+            except Exception as exc:
+                intraday_error = str(exc)
+                df_today = pd.DataFrame()
+
+            raw_history = api.get_historical_candles(
                 instrument_key=NIFTY_KEY,
                 interval="1minute",
                 to_date=end.isoformat(),
                 from_date=start.isoformat(),
             )
-            df = normalize_candles(raw)
+            df_history = normalize_candles(raw_history)
+            df = pd.concat([df_history, df_today], ignore_index=True)
+            if not df.empty:
+                df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
             st.session_state.candles = df
+            if intraday_error:
+                st.warning(f"Today's intraday endpoint could not be read: {intraday_error}")
             if df.empty:
                 st.session_state.analysis = None
                 st.error("No usable candle data returned.")
@@ -274,8 +293,14 @@ with c3:
                 now = datetime.now(IST)
                 fresh = False
                 if pd.notna(last_ts):
-                    age = (now - last_ts.to_pydatetime()).total_seconds() / 60
-                    fresh = age <= 15 and now.time() >= datetime.strptime("09:15", "%H:%M").time() and now.time() <= datetime.strptime("15:30", "%H:%M").time()
+                    last_dt = last_ts.to_pydatetime()
+                    age = (now - last_dt).total_seconds() / 60
+                    is_today = last_dt.astimezone(IST).date() == now.date()
+                    during_session = (
+                        now.time() >= datetime.strptime("09:15", "%H:%M").time()
+                        and now.time() <= datetime.strptime("15:30", "%H:%M").time()
+                    )
+                    fresh = is_today and 0 <= age <= 15 and during_session
                 st.session_state.analysis = {
                     "5m": s5, "15m": s15, "combined": combined,
                     "last_candle": last_ts, "fresh": fresh,
